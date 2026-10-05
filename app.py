@@ -3,6 +3,7 @@ import html
 import streamlit as st
 import uuid
 import datetime
+from urllib.parse import quote
 import extra_streamlit_components as stx
 from models import (Institution, User, Category, Tracking, Item, Post, load_database,
                     save_to_supabase, update_status_in_supabase, authenticate_user, restore_session)
@@ -34,17 +35,14 @@ footer { visibility: hidden; }
 .fi-welcome .fi-logo { margin: 0 auto 16px; width: 56px; height: 56px; font-size: 1.8rem; border-radius: 18px; }
 .fi-welcome h2 { margin: 0; font-weight: 700; }
 .fi-welcome p { color: #80868B; margin: 4px 0 0; }
-[data-baseweb="tab-list"] { gap: 8px; }
-button[data-baseweb="tab"] { border-radius: 999px; padding: 8px 20px; background: #101010; height: auto; }
-button[data-baseweb="tab"] p { color: #9AA0A6; font-weight: 500; }
-button[data-baseweb="tab"][aria-selected="true"] { background: #1E2A3A; }
-button[data-baseweb="tab"][aria-selected="true"] p { color: #D3E3FD; }
-[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] { display: none; }
-.fi-card { background: #101010; border: 1px solid #1F1F1F; border-radius: 28px; padding: 12px 12px 16px; margin-bottom: 8px; }
-.fi-card:hover { border-color: #3A4A63; }
-.fi-img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 20px; display: block; margin-bottom: 12px; }
+[data-testid="stBaseButton-pills"], [data-testid="stBaseButton-pillsActive"] { border-radius: 999px !important; padding: 6px 18px !important; }
+[data-testid="stBaseButton-pillsActive"] { background: #A8C7FA !important; border-color: #A8C7FA !important; }
+[data-testid="stBaseButton-pillsActive"] p { color: #062E6F !important; font-weight: 500; }
+[class*="st-key-card_"] { background: #101010; border: 1px solid #1F1F1F; border-radius: 28px; padding: 12px; gap: 0.6rem; margin-bottom: 8px; }
+[class*="st-key-card_"]:hover { border-color: #3A4A63; }
+.fi-img { width: 100%; aspect-ratio: 4 / 3; background-size: cover; background-position: center; border-radius: 20px; }
 .fi-noimg { background: #181818; color: #5F6368; display: flex; align-items: center; justify-content: center; }
-.fi-body { padding: 0 6px; }
+.fi-body { padding: 8px 6px 0; }
 .fi-title { font-size: 1.15rem; font-weight: 500; margin: 0 0 8px; }
 .fi-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .fi-chip { padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 500; background: #1E2A3A; color: #D3E3FD; }
@@ -54,13 +52,18 @@ button[data-baseweb="tab"][aria-selected="true"] p { color: #D3E3FD; }
 .fi-desc { color: #C4C7C5; margin: 0 0 8px; font-size: 0.9rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .fi-meta { color: #80868B; font-size: 0.75rem; }
 .fi-empty { text-align: center; color: #80868B; padding: 48px 16px; border: 1px dashed #2A2A2A; border-radius: 28px; }
-.stButton > button, .stFormSubmitButton > button { background: #A8C7FA; border: none; border-radius: 999px; padding: 0.5rem 1.5rem; }
+.stButton > button, .stFormSubmitButton > button { width: 100%; background: #A8C7FA; border: none; border-radius: 999px; padding: 0.5rem 1.5rem; }
 .stButton > button:hover, .stFormSubmitButton > button:hover { background: #C2D7FB; }
 .stButton > button p, .stFormSubmitButton > button p { color: #062E6F; font-weight: 500; }
+[class*="st-key-view_"] button { background: #1E2A3A !important; }
+[class*="st-key-view_"] button p { color: #D3E3FD !important; }
+.st-key-logout button { background: transparent !important; border: 1px solid #2A2A2A !important; }
+.st-key-logout button p { color: #C4C7C5 !important; }
 [data-testid="stForm"] { background: #101010; border: 1px solid #232323; border-radius: 28px; padding: 20px; }
-[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div { border-radius: 16px; }
-.st-key-feed_search [data-baseweb="input"] { border-radius: 999px; }
-.st-key-feed_search input { padding-left: 18px; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"], [data-baseweb="select"] > div { border-radius: 16px !important; }
+.st-key-feed_search [data-baseweb="input"], .st-key-feed_search [data-baseweb="base-input"], .st-key-feed_search input { border-radius: 999px !important; }
+.st-key-feed_search input { padding-left: 18px !important; }
+.st-key-feed_campus [data-baseweb="select"] > div { border-radius: 999px !important; }
 """
 
 st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
@@ -87,27 +90,55 @@ def esc(value):
     return html.escape(str(value or ""))
 
 
-def render_card(post, claimed=False):
+def media_html(item):
+    if item.image_url:
+        style = f"background-image:url('{quote(item.image_url, safe=':/?=&%#')}')"
+        return f'<div class="fi-img" style="{style}"></div>'
+    return '<div class="fi-img fi-noimg">No photo</div>'
+
+
+def chips_html(post, claimed=False):
     item = post.item
     status = item.tracking.current_status
-    if item.image_url:
-        img = f'<img class="fi-img" src="{html.escape(item.image_url, quote=True)}">'
-    else:
-        img = '<div class="fi-img fi-noimg">No photo</div>'
     chips = "" if claimed else f'<span class="fi-chip {STATUS_CLASS.get(status, "")}">{esc(status)}</span>'
     chips += f'<span class="fi-chip">{esc(item.campus_location)}</span><span class="fi-chip">{esc(item.category.category_name)}</span>'
+    return chips
+
+
+def foot_text(post, claimed=False):
     if claimed:
-        remaining = days_left(item.tracking.date_claimed)
-        desc = ""
-        foot = f"Removed in {remaining} day(s)" if remaining is not None else ""
-    else:
-        desc = f'<p class="fi-desc">{esc(item.description).replace(chr(10), " ")}</p>'
-        foot = f"Posted by {esc(post.user.username)} on {esc(post.date_posted)}"
+        remaining = days_left(post.item.tracking.date_claimed)
+        return f"Removed in {remaining} day(s)" if remaining is not None else ""
+    return f"Posted by {esc(post.user.username)} on {esc(post.date_posted)}"
+
+
+def card_html(post, claimed=False):
+    item = post.item
+    desc = "" if claimed else f'<p class="fi-desc">{esc(item.description).replace(chr(10), " ")}</p>'
+    return (
+        f'{media_html(item)}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
+        f'<div class="fi-chips">{chips_html(post, claimed)}</div>{desc}'
+        f'<div class="fi-meta">{foot_text(post, claimed)}</div></div>'
+    )
+
+
+@st.dialog("Item details")
+def show_details(post, claimed=False):
+    item = post.item
     st.markdown(
-        f'<div class="fi-card">{img}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
-        f'<div class="fi-chips">{chips}</div>{desc}<div class="fi-meta">{foot}</div></div></div>',
+        f'{media_html(item)}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
+        f'<div class="fi-chips">{chips_html(post, claimed)}</div></div>',
         unsafe_allow_html=True,
     )
+    st.write(item.description or "No description provided.")
+    st.caption(foot_text(post, claimed))
+
+
+def render_card(post, claimed=False):
+    with st.container(key=f"card_{post.post_id}"):
+        st.markdown(card_html(post, claimed), unsafe_allow_html=True)
+        if st.button("View details", key=f"view_{post.post_id}"):
+            show_details(post, claimed)
 
 
 def render_grid(posts, claimed=False):
@@ -115,7 +146,7 @@ def render_grid(posts, claimed=False):
         cols = st.columns(2, gap="medium")
         for col, post in zip(cols, posts[i:i + 2]):
             with col:
-                render_card(post, claimed=claimed)
+                render_card(post, claimed)
 
 
 def empty_state(message):
@@ -187,7 +218,7 @@ if not st.session_state.current_user:
         with st.form("login_form"):
             email = st.text_input("Institutional Email")
             password = st.text_input("Password", type="password")
-            submit_login = st.form_submit_button("Login", use_container_width=True)
+            submit_login = st.form_submit_button("Login")
 
             if submit_login:
                 auth_result = authenticate_user(email, password)
@@ -218,20 +249,28 @@ else:
             unsafe_allow_html=True,
         )
     with c_out:
-        if st.button("Logout", use_container_width=True):
+        if st.button("Logout", key="logout"):
             st.session_state.current_user = None
             st.session_state.logged_out = True
             st.session_state.pending_delete = True
+            st.session_state.pop("nav", None)
             st.rerun()
 
     if not user.is_admin:
         st.caption("Standard account: only administrators can report or update items.")
 
-    tab_names = ["Feed", "Claimed"] + (["Report", "Update status"] if user.is_admin else [])
-    tabs = st.tabs(tab_names)
+    # --- NAVIGATION ---
+    active_count = sum(1 for p in st.session_state.posts if p.item.tracking.current_status != "Claimed")
+    claimed_count = len(st.session_state.posts) - active_count
+    nav_labels = {"Feed": f"Feed · {active_count}", "Claimed": f"Claimed · {claimed_count}"}
+    sections = ["Feed", "Claimed"] + (["Report", "Update status"] if user.is_admin else [])
+    navigation = st.pills(
+        "Section", sections, default="Feed", key="nav",
+        format_func=lambda s: nav_labels.get(s, s), label_visibility="collapsed",
+    ) or "Feed"
 
     # --- 1. FEED (active items only) ---
-    with tabs[0]:
+    if navigation == "Feed":
         col_search, col_campus = st.columns([3, 1])
         with col_search:
             search_query = st.text_input(
@@ -243,6 +282,11 @@ else:
                 "Campus", ["All Campuses"] + CAMPUS_LOCATIONS, key="feed_campus", label_visibility="collapsed"
             )
 
+        category_filter = st.pills(
+            "Category", ["All"] + [c.category_name for c in st.session_state.categories],
+            default="All", key="feed_cat", label_visibility="collapsed",
+        ) or "All"
+
         posts_to_display = [
             p for p in st.session_state.posts[::-1]
             if p.item.tracking.current_status != "Claimed"
@@ -252,6 +296,12 @@ else:
             posts_to_display = [
                 p for p in posts_to_display
                 if p.item.campus_location == campus_filter
+            ]
+
+        if category_filter != "All":
+            posts_to_display = [
+                p for p in posts_to_display
+                if p.item.category.category_name == category_filter
             ]
 
         if search_query:
@@ -265,11 +315,10 @@ else:
         if not posts_to_display:
             empty_state("No items match your search or filter.")
         else:
-            st.caption(f"{len(posts_to_display)} item(s)")
             render_grid(posts_to_display)
 
     # --- 2. CLAIMED ITEMS (kept for 7 days, then auto-purged) ---
-    with tabs[1]:
+    elif navigation == "Claimed":
         st.caption(f"Claimed items stay here for {CLAIMED_RETENTION_DAYS} days, then are removed automatically.")
         claimed_campus = st.selectbox(
             "Campus", ["All Campuses"] + CAMPUS_LOCATIONS, key="claimed_campus", label_visibility="collapsed"
@@ -287,45 +336,45 @@ else:
         else:
             render_grid(claimed_posts, claimed=True)
 
-    if user.is_admin:
-        # --- 3. REPORT ITEM (Admin Only) ---
-        with tabs[2]:
-            with st.form("report_form"):
-                item_name = st.text_input("Item Name")
-                description = st.text_area("Description / Distinguishing Features")
-                campus_location = st.selectbox("Campus Holding Office", CAMPUS_LOCATIONS)
+    # --- 3. REPORT ITEM (Admin Only) ---
+    elif navigation == "Report" and user.is_admin:
+        with st.form("report_form"):
+            uploaded_image = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"])
+            item_name = st.text_input("Item Name")
+            description = st.text_area("Description / Distinguishing Features")
+            campus_location = st.selectbox("Campus Holding Office", CAMPUS_LOCATIONS)
 
-                cat_names = [cat.category_name for cat in st.session_state.categories]
-                selected_cat_name = st.selectbox("Category", cat_names)
+            cat_names = [cat.category_name for cat in st.session_state.categories]
+            selected_cat_name = st.selectbox("Category", cat_names)
 
-                uploaded_image = st.file_uploader("Upload Item Photo", type=["jpg", "jpeg", "png"])
+            submit_post = st.form_submit_button("Post Item")
 
-                submit_post = st.form_submit_button("Post Item")
+            if submit_post:
+                if item_name.strip():
+                    selected_cat = next(cat for cat in st.session_state.categories if cat.category_name == selected_cat_name)
+                    new_item = Item(item_name, description, selected_cat, campus_location=campus_location)
+                    today_date = datetime.date.today().strftime("%Y-%m-%d")
+                    new_post = Post(f"POST-{int(datetime.datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}", today_date, st.session_state.current_user, new_item)
 
-                if submit_post:
-                    if item_name.strip():
-                        selected_cat = next(cat for cat in st.session_state.categories if cat.category_name == selected_cat_name)
-                        new_item = Item(item_name, description, selected_cat, campus_location=campus_location)
-                        today_date = datetime.date.today().strftime("%Y-%m-%d")
-                        new_post = Post(f"POST-{int(datetime.datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}", today_date, st.session_state.current_user, new_item)
+                    save_to_supabase(new_post, image_file=uploaded_image)
+                    st.session_state.posts = load_database(st.session_state.categories)
+                    st.success("Item posted successfully and saved to Supabase!")
+                else:
+                    st.warning("Please provide an item name.")
 
-                        save_to_supabase(new_post, image_file=uploaded_image)
-                        st.session_state.posts = load_database(st.session_state.categories)
-                        st.success("Item posted successfully and saved to Supabase!")
-                    else:
-                        st.warning("Please provide an item name.")
+    # --- 4. UPDATE TRACKING STATUS (Admin Only) ---
+    elif navigation == "Update status" and user.is_admin:
+        # Show the message saved before the rerun, then clear it
+        if st.session_state.status_msg:
+            st.success(st.session_state.status_msg)
+            st.session_state.status_msg = None
 
-        # --- 4. UPDATE TRACKING STATUS (Admin Only) ---
-        with tabs[3]:
-            # Show the message saved before the rerun, then clear it
-            if st.session_state.status_msg:
-                st.success(st.session_state.status_msg)
-                st.session_state.status_msg = None
-
-            if not st.session_state.posts:
-                empty_state("No items available to update.")
-            else:
-                post_options = {p.post_id: p for p in st.session_state.posts}
+        if not st.session_state.posts:
+            empty_state("No items available to update.")
+        else:
+            post_options = {p.post_id: p for p in st.session_state.posts}
+            left, right = st.columns(2, gap="large")
+            with left:
                 selected_id = st.selectbox(
                     "Select Item to Update",
                     list(post_options.keys()),
@@ -333,10 +382,14 @@ else:
                 )
                 target_post = post_options[selected_id]
                 new_status = st.radio("Select New Status", ["Lost", "Pending Claim", "Claimed"], horizontal=True)
+                apply_update = st.button("Apply Status Update")
+            with right:
+                with st.container(key="card_preview"):
+                    st.markdown(card_html(target_post), unsafe_allow_html=True)
 
-                if st.button("Apply Status Update"):
-                    target_post.item.tracking.update_tracking_status(new_status)
-                    update_status_in_supabase(target_post.post_id, new_status)
-                    st.session_state.posts = load_database(st.session_state.categories)
-                    st.session_state.status_msg = f"Status updated to **{new_status}** in Supabase!"
-                    st.rerun()
+            if apply_update:
+                target_post.item.tracking.update_tracking_status(new_status)
+                update_status_in_supabase(target_post.post_id, new_status)
+                st.session_state.posts = load_database(st.session_state.categories)
+                st.session_state.status_msg = f"Status updated to **{new_status}** in Supabase!"
+                st.rerun()
