@@ -1,3 +1,4 @@
 streamlit
+pillow
 supabase
 extra-streamlit-components
