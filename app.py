@@ -40,7 +40,8 @@ footer { visibility: hidden; }
 [data-testid="stBaseButton-pills"], [data-testid="stBaseButton-pillsActive"] { border-radius: 999px !important; padding: 6px 18px !important; }
 [data-testid="stBaseButton-pillsActive"] { background: #A8C7FA !important; border-color: #A8C7FA !important; }
 [data-testid="stBaseButton-pillsActive"] p { color: #062E6F !important; font-weight: 500; }
-[class*="st-key-card_"] { background: #101010; border: 1px solid #1F1F1F; border-radius: 28px; padding: 12px; gap: 0.6rem; margin-bottom: 8px; }
+.st-key-grid_col_0, .st-key-grid_col_1 { gap: 1rem !important; }
+[class*="st-key-card_"] { background: #101010; border: 1px solid #1F1F1F; border-radius: 28px; padding: 12px; gap: 0.6rem; }
 [class*="st-key-card_"]:hover { border-color: #3A4A63; }
 .fi-img { width: 100%; aspect-ratio: 4 / 3; background-size: cover; background-position: center; border-radius: 20px; }
 .fi-noimg { background: #181818; color: #5F6368; display: flex; align-items: center; justify-content: center; }
@@ -178,11 +179,12 @@ def render_card(post, claimed=False):
 
 
 def render_grid(posts, claimed=False):
-    for i in range(0, len(posts), 2):
-        cols = st.columns(2, gap="medium")
-        for col, post in zip(cols, posts[i:i + 2]):
-            with col:
-                render_card(post, claimed)
+    cols = st.columns(2, gap="small")
+    for idx, col in enumerate(cols):
+        with col:
+            with st.container(key=f"grid_col_{idx}"):
+                for post in posts[idx::2]:
+                    render_card(post, claimed)
 
 
 def empty_state(message):
