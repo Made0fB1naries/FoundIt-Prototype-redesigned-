@@ -1,4 +1,5 @@
 # app.py
+import html
 import streamlit as st
 import uuid
 import datetime
@@ -12,6 +13,36 @@ COOKIE_NAME = "foundit_refresh_token"
 COOKIE_DAYS = 7
 CLAIMED_RETENTION_DAYS = 7
 CAMPUS_LOCATIONS = ["RSY Building", "RG Birrey"]
+STATUS_CLASS = {"Lost": "fi-lost", "Pending Claim": "fi-pending", "Claimed": "fi-claimed"}
+
+THEME_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+html, body, .stApp, button, input, textarea { font-family: 'Roboto', sans-serif; }
+.stApp { background: #000000; }
+[data-testid="stSidebar"] { background: #0A0A0A; border-right: 1px solid #1A1A1A; }
+.block-container { padding-top: 2.5rem; max-width: 720px; }
+footer { visibility: hidden; }
+h1 { font-weight: 700; letter-spacing: -0.5px; }
+h2, h3 { font-weight: 500; }
+.fi-card { background: #101010; border: 1px solid #232323; border-radius: 28px; padding: 16px; margin-bottom: 16px; }
+.fi-img { width: 100%; max-height: 280px; object-fit: cover; border-radius: 20px; margin-bottom: 12px; display: block; }
+.fi-title { font-size: 1.25rem; font-weight: 500; margin: 0 0 8px; }
+.fi-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.fi-chip { padding: 4px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 500; background: #1E2A3A; color: #D3E3FD; }
+.fi-lost { background: #4A1D1D; color: #FFB4AB; }
+.fi-pending { background: #4A3B00; color: #FFDF8B; }
+.fi-claimed { background: #0F3D22; color: #A8E6B8; }
+.fi-desc { color: #C4C7C5; margin: 0 0 8px; }
+.fi-meta { color: #80868B; font-size: 0.8rem; }
+.fi-empty { text-align: center; color: #80868B; padding: 48px 16px; border: 1px dashed #2A2A2A; border-radius: 28px; }
+.stButton > button, .stFormSubmitButton > button { background: #A8C7FA; border: none; border-radius: 999px; padding: 0.5rem 1.5rem; }
+.stButton > button:hover, .stFormSubmitButton > button:hover { background: #C2D7FB; }
+.stButton > button p, .stFormSubmitButton > button p { color: #062E6F; font-weight: 500; }
+[data-testid="stForm"] { background: #101010; border: 1px solid #232323; border-radius: 28px; padding: 20px; }
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div { border-radius: 16px; }
+"""
+
+st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
 
 cookie_manager = stx.CookieManager()
 
@@ -29,6 +60,34 @@ def days_left(date_claimed):
         return max(remaining.days, 0)
     except (TypeError, ValueError):
         return None
+
+
+def esc(value):
+    return html.escape(str(value or ""))
+
+
+def render_card(post, claimed=False):
+    item = post.item
+    status = item.tracking.current_status
+    img = f'<img class="fi-img" src="{html.escape(item.image_url, quote=True)}">' if item.image_url else ""
+    chips = "" if claimed else f'<span class="fi-chip {STATUS_CLASS.get(status, "")}">{esc(status)}</span>'
+    chips += f'<span class="fi-chip">{esc(item.campus_location)}</span><span class="fi-chip">{esc(item.category.category_name)}</span>'
+    if claimed:
+        remaining = days_left(item.tracking.date_claimed)
+        desc = ""
+        foot = f"Removed in {remaining} day(s)" if remaining is not None else ""
+    else:
+        desc = f'<p class="fi-desc">{esc(item.description).replace(chr(10), "<br>")}</p>'
+        foot = f"Posted by {esc(post.user.username)} on {esc(post.date_posted)}"
+    st.markdown(
+        f'<div class="fi-card">{img}<div class="fi-title">{esc(item.item_name)}</div>'
+        f'<div class="fi-chips">{chips}</div>{desc}<div class="fi-meta">{foot}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def empty_state(message):
+    st.markdown(f'<div class="fi-empty">{esc(message)}</div>', unsafe_allow_html=True)
 
 
 if "categories" not in st.session_state:
@@ -86,7 +145,6 @@ if st.session_state.pending_delete and not st.session_state.current_user:
 
 st.title("FoundIt: Campus Lost & Found Hub")
 st.caption(f"{school.get_details()}")
-st.markdown("---")
 
 # --- AUTHENTICATION ---
 if not st.session_state.current_user:
@@ -158,19 +216,11 @@ else:
             ]
 
         if not posts_to_display:
-            st.info("No items match your search or filter.")
+            empty_state("No items match your search or filter.")
         else:
+            st.caption(f"{len(posts_to_display)} item(s)")
             for post in posts_to_display:
-                with st.container():
-                    st.subheader(f"{post.item.item_name}")
-                    if post.item.image_url:
-                        st.image(post.item.image_url, width=300)
-                    st.write(f"**Status:** `{post.item.tracking.current_status}`")
-                    st.write(f"**Campus Location:** `{post.item.campus_location}`")
-                    st.write(f"**Category:** {post.item.category.category_name}")
-                    st.write(f"**Description:** {post.item.description}")
-                    st.caption(f"Posted by {post.user.username} on {post.date_posted}")
-                    st.markdown("---")
+                render_card(post)
 
     # --- 2. CLAIMED ITEMS (kept for 7 days, then auto-purged) ---
     elif navigation == "Claimed Items":
@@ -186,18 +236,10 @@ else:
             claimed_posts = [p for p in claimed_posts if p.item.campus_location == claimed_campus]
 
         if not claimed_posts:
-            st.info("No claimed items.")
+            empty_state("No claimed items.")
         else:
             for post in claimed_posts:
-                st.subheader(post.item.item_name)
-                if post.item.image_url:
-                    st.image(post.item.image_url, width=300)
-                st.write(f"**Campus Location:** `{post.item.campus_location}`")
-                st.write(f"**Category:** {post.item.category.category_name}")
-                remaining = days_left(post.item.tracking.date_claimed)
-                if remaining is not None:
-                    st.caption(f"Removed in {remaining} day(s)")
-                st.markdown("---")
+                render_card(post, claimed=True)
 
     # --- 3. REPORT ITEM (Admin Only) ---
     elif navigation == "Report Item":
@@ -237,7 +279,7 @@ else:
             st.session_state.status_msg = None
 
         if not st.session_state.posts:
-            st.info("No items available to update.")
+            empty_state("No items available to update.")
         else:
             post_options = {p.post_id: p for p in st.session_state.posts}
             selected_id = st.selectbox(
@@ -246,7 +288,7 @@ else:
                 format_func=lambda pid: f"{post_options[pid].item.item_name} ({post_options[pid].item.tracking.current_status}) - {post_options[pid].user.username}",
             )
             target_post = post_options[selected_id]
-            new_status = st.radio("Select New Status", ["Lost", "Pending Claim", "Claimed"])
+            new_status = st.radio("Select New Status", ["Lost", "Pending Claim", "Claimed"], horizontal=True)
 
             if st.button("Apply Status Update"):
                 target_post.item.tracking.update_tracking_status(new_status)
