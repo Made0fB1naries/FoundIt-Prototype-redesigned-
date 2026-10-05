@@ -1,9 +1,11 @@
 # app.py
+import io
 import html
 import streamlit as st
 import uuid
 import datetime
 from urllib.parse import quote
+from PIL import Image, ImageDraw, ImageOps
 import extra_streamlit_components as stx
 from models import (Institution, User, Category, Tracking, Item, Post, load_database,
                     save_to_supabase, update_status_in_supabase, authenticate_user, restore_session)
@@ -42,21 +44,19 @@ footer { visibility: hidden; }
 [class*="st-key-card_"]:hover { border-color: #3A4A63; }
 .fi-img { width: 100%; aspect-ratio: 4 / 3; background-size: cover; background-position: center; border-radius: 20px; }
 .fi-noimg { background: #181818; color: #5F6368; display: flex; align-items: center; justify-content: center; }
-.fi-body { padding: 8px 6px 0; }
+.fi-body { padding: 8px 6px 4px; }
 .fi-title { font-size: 1.15rem; font-weight: 500; margin: 0 0 8px; }
 .fi-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .fi-chip { padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 500; background: #1E2A3A; color: #D3E3FD; }
 .fi-lost { background: #4A1D1D; color: #FFB4AB; }
 .fi-pending { background: #4A3B00; color: #FFDF8B; }
 .fi-claimed { background: #0F3D22; color: #A8E6B8; }
-.fi-desc { color: #C4C7C5; margin: 0 0 8px; font-size: 0.9rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.fi-desc { color: #C4C7C5; margin: 0 0 8px; font-size: 0.9rem; }
 .fi-meta { color: #80868B; font-size: 0.75rem; }
 .fi-empty { text-align: center; color: #80868B; padding: 48px 16px; border: 1px dashed #2A2A2A; border-radius: 28px; }
 .stButton > button, .stFormSubmitButton > button { width: 100%; background: #A8C7FA; border: none; border-radius: 999px; padding: 0.5rem 1.5rem; }
 .stButton > button:hover, .stFormSubmitButton > button:hover { background: #C2D7FB; }
 .stButton > button p, .stFormSubmitButton > button p { color: #062E6F; font-weight: 500; }
-[class*="st-key-view_"] button { background: #1E2A3A !important; }
-[class*="st-key-view_"] button p { color: #D3E3FD !important; }
 .st-key-logout button { background: transparent !important; border: 1px solid #2A2A2A !important; }
 .st-key-logout button p { color: #C4C7C5 !important; }
 [data-testid="stForm"] { background: #101010; border: 1px solid #232323; border-radius: 28px; padding: 20px; }
@@ -90,6 +90,56 @@ def esc(value):
     return html.escape(str(value or ""))
 
 
+# --- PHOTO CROP HELPERS (4:3) ---
+class ProcessedImage:
+    """Quacks like an uploaded file so save_to_supabase works unchanged."""
+
+    def __init__(self, data, name="photo.jpg", type="image/jpeg"):
+        self._data = data
+        self.name = name
+        self.type = type
+
+    def getvalue(self):
+        return self._data
+
+
+def crop_box(size, fx, fy):
+    w, h = size
+    if w * 3 > h * 4:
+        cw, ch = h * 4 // 3, h
+    else:
+        cw, ch = w, w * 3 // 4
+    return int((w - cw) * fx), int((h - ch) * fy), cw, ch
+
+
+def guide_preview(img, fx, fy):
+    work = img.copy()
+    work.thumbnail((1000, 1000))
+    left, top, cw, ch = crop_box(work.size, fx, fy)
+    dim = Image.blend(work, Image.new("RGB", work.size, (0, 0, 0)), 0.65)
+    dim.paste(work.crop((left, top, left + cw, top + ch)), (left, top))
+    draw = ImageDraw.Draw(dim)
+    accent = (168, 199, 250)
+    lw = max(2, work.width // 250)
+    draw.rectangle((left, top, left + cw - 1, top + ch - 1), outline=accent, width=lw)
+    cx, cy = left + cw // 2, top + ch // 2
+    arm = max(12, cw // 14)
+    draw.line((cx - arm, cy, cx + arm, cy), fill=accent, width=lw)
+    draw.line((cx, cy - arm, cx, cy + arm), fill=accent, width=lw)
+    draw.ellipse((cx - arm, cy - arm, cx + arm, cy + arm), outline=accent, width=lw)
+    return dim
+
+
+def prepare_photo(img, fx, fy):
+    left, top, cw, ch = crop_box(img.size, fx, fy)
+    out = img.crop((left, top, left + cw, top + ch))
+    out.thumbnail((1200, 900))
+    buf = io.BytesIO()
+    out.save(buf, format="JPEG", quality=90)
+    return ProcessedImage(buf.getvalue())
+
+
+# --- CARD HELPERS ---
 def media_html(item):
     if item.image_url:
         style = f"background-image:url('{quote(item.image_url, safe=':/?=&%#')}')"
@@ -114,7 +164,7 @@ def foot_text(post, claimed=False):
 
 def card_html(post, claimed=False):
     item = post.item
-    desc = "" if claimed else f'<p class="fi-desc">{esc(item.description).replace(chr(10), " ")}</p>'
+    desc = "" if claimed else f'<p class="fi-desc">{esc(item.description).replace(chr(10), "<br>")}</p>'
     return (
         f'{media_html(item)}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
         f'<div class="fi-chips">{chips_html(post, claimed)}</div>{desc}'
@@ -122,23 +172,9 @@ def card_html(post, claimed=False):
     )
 
 
-@st.dialog("Item details")
-def show_details(post, claimed=False):
-    item = post.item
-    st.markdown(
-        f'{media_html(item)}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
-        f'<div class="fi-chips">{chips_html(post, claimed)}</div></div>',
-        unsafe_allow_html=True,
-    )
-    st.write(item.description or "No description provided.")
-    st.caption(foot_text(post, claimed))
-
-
 def render_card(post, claimed=False):
     with st.container(key=f"card_{post.post_id}"):
         st.markdown(card_html(post, claimed), unsafe_allow_html=True)
-        if st.button("View details", key=f"view_{post.post_id}"):
-            show_details(post, claimed)
 
 
 def render_grid(posts, claimed=False):
@@ -178,6 +214,12 @@ if "pending_delete" not in st.session_state:
 
 if "status_msg" not in st.session_state:
     st.session_state.status_msg = None
+
+if "report_n" not in st.session_state:
+    st.session_state.report_n = 0
+
+if "report_msg" not in st.session_state:
+    st.session_state.report_msg = None
 
 # --- AUTO-LOGIN FROM COOKIE (survives page refresh) ---
 if not st.session_state.current_user and not st.session_state.logged_out:
@@ -260,14 +302,8 @@ else:
         st.caption("Standard account: only administrators can report or update items.")
 
     # --- NAVIGATION ---
-    active_count = sum(1 for p in st.session_state.posts if p.item.tracking.current_status != "Claimed")
-    claimed_count = len(st.session_state.posts) - active_count
-    nav_labels = {"Feed": f"Feed · {active_count}", "Claimed": f"Claimed · {claimed_count}"}
     sections = ["Feed", "Claimed"] + (["Report", "Update status"] if user.is_admin else [])
-    navigation = st.pills(
-        "Section", sections, default="Feed", key="nav",
-        format_func=lambda s: nav_labels.get(s, s), label_visibility="collapsed",
-    ) or "Feed"
+    navigation = st.pills("Section", sections, default="Feed", key="nav", label_visibility="collapsed") or "Feed"
 
     # --- 1. FEED (active items only) ---
     if navigation == "Feed":
@@ -282,11 +318,6 @@ else:
                 "Campus", ["All Campuses"] + CAMPUS_LOCATIONS, key="feed_campus", label_visibility="collapsed"
             )
 
-        category_filter = st.pills(
-            "Category", ["All"] + [c.category_name for c in st.session_state.categories],
-            default="All", key="feed_cat", label_visibility="collapsed",
-        ) or "All"
-
         posts_to_display = [
             p for p in st.session_state.posts[::-1]
             if p.item.tracking.current_status != "Claimed"
@@ -296,12 +327,6 @@ else:
             posts_to_display = [
                 p for p in posts_to_display
                 if p.item.campus_location == campus_filter
-            ]
-
-        if category_filter != "All":
-            posts_to_display = [
-                p for p in posts_to_display
-                if p.item.category.category_name == category_filter
             ]
 
         if search_query:
@@ -338,27 +363,55 @@ else:
 
     # --- 3. REPORT ITEM (Admin Only) ---
     elif navigation == "Report" and user.is_admin:
-        with st.form("report_form"):
-            uploaded_image = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"])
-            item_name = st.text_input("Item Name")
-            description = st.text_area("Description / Distinguishing Features")
-            campus_location = st.selectbox("Campus Holding Office", CAMPUS_LOCATIONS)
+        rk = st.session_state.report_n
+
+        if st.session_state.report_msg:
+            st.success(st.session_state.report_msg)
+            st.session_state.report_msg = None
+
+        left, right = st.columns(2, gap="large")
+        photo = None
+
+        with left:
+            uploaded_image = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"], key=f"r_photo_{rk}")
+            if uploaded_image:
+                try:
+                    src = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded_image.getvalue()))).convert("RGB")
+                except Exception:
+                    src = None
+                    st.error("Could not read this image. Try another photo.")
+                if src:
+                    w, h = src.size
+                    fx = fy = 0.5
+                    skey = f"{rk}_{uploaded_image.name}_{uploaded_image.size}"
+                    if w * 3 > h * 4:
+                        fx = st.slider("Move the frame left / right", 0, 100, 50, key=f"r_x_{skey}") / 100
+                    elif w * 3 < h * 4:
+                        fy = st.slider("Move the frame up / down", 0, 100, 50, key=f"r_y_{skey}") / 100
+                    st.image(guide_preview(src, fx, fy))
+                    st.caption("Only the bright area is posted. Keep the item inside the frame and on the center mark.")
+                    photo = prepare_photo(src, fx, fy)
+
+        with right:
+            item_name = st.text_input("Item Name", key=f"r_name_{rk}")
+            description = st.text_area("Description / Distinguishing Features", key=f"r_desc_{rk}")
+            campus_location = st.selectbox("Campus Holding Office", CAMPUS_LOCATIONS, key=f"r_campus_{rk}")
 
             cat_names = [cat.category_name for cat in st.session_state.categories]
-            selected_cat_name = st.selectbox("Category", cat_names)
+            selected_cat_name = st.selectbox("Category", cat_names, key=f"r_cat_{rk}")
 
-            submit_post = st.form_submit_button("Post Item")
-
-            if submit_post:
+            if st.button("Post Item", key="post_item"):
                 if item_name.strip():
                     selected_cat = next(cat for cat in st.session_state.categories if cat.category_name == selected_cat_name)
                     new_item = Item(item_name, description, selected_cat, campus_location=campus_location)
                     today_date = datetime.date.today().strftime("%Y-%m-%d")
                     new_post = Post(f"POST-{int(datetime.datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}", today_date, st.session_state.current_user, new_item)
 
-                    save_to_supabase(new_post, image_file=uploaded_image)
+                    save_to_supabase(new_post, image_file=photo)
                     st.session_state.posts = load_database(st.session_state.categories)
-                    st.success("Item posted successfully and saved to Supabase!")
+                    st.session_state.report_n += 1
+                    st.session_state.report_msg = "Item posted successfully and saved to Supabase!"
+                    st.rerun()
                 else:
                     st.warning("Please provide an item name.")
 
