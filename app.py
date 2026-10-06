@@ -1,24 +1,20 @@
 # app.py
-import io
 import html
-import streamlit as st
-import uuid
 import datetime
+from abc import ABC, abstractmethod
 from urllib.parse import quote
-from PIL import Image, ImageDraw, ImageOps
+
+import streamlit as st
 import extra_streamlit_components as stx
-from models import (Institution, User, Category, Tracking, Item, Post, load_database,
-                    save_to_supabase, update_status_in_supabase, authenticate_user, restore_session)
 
-st.set_page_config(page_title="FoundIt - Campus Lost & Found", page_icon="", layout="centered")
+from models import (AuthService, CategoryCatalog, Institution, LostAndFoundService, PhotoCropper,
+                    Status, SupabaseImageStorage, SupabasePostRepository, ValidationError, get_gateway)
 
-COOKIE_NAME = "foundit_refresh_token"
-COOKIE_DAYS = 7
-CLAIMED_RETENTION_DAYS = 7
-CAMPUS_LOCATIONS = ["RSY Building", "RG Birrey"]
-STATUS_CLASS = {"Lost": "fi-lost", "Pending Claim": "fi-pending", "Claimed": "fi-claimed"}
 
-THEME_CSS = """
+# ---------------------------------------------------------------- UI redesign
+
+class Theme:
+    CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
 html, body, .stApp, button, input, textarea, label, p, h1, h2, h3 { font-family: 'Roboto', sans-serif; }
 .stApp { background: #000000; }
@@ -67,384 +63,414 @@ footer { visibility: hidden; }
 .st-key-feed_campus [data-baseweb="select"] > div { border-radius: 999px !important; }
 """
 
-st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
-
-cookie_manager = stx.CookieManager()
-
-school = Institution("Mapúa Malayan Colleges Mindanao", "Davao City")
+    @classmethod
+    def apply(cls):
+        st.markdown(f"<style>{cls.CSS}</style>", unsafe_allow_html=True)
 
 
-def days_left(date_claimed):
-    """Days remaining before a claimed item is purged, or None if unknown."""
-    try:
-        claimed_at = datetime.datetime.fromisoformat(date_claimed)
-        if claimed_at.tzinfo is None:
-            claimed_at = claimed_at.replace(tzinfo=datetime.timezone.utc)
-        expires_at = claimed_at + datetime.timedelta(days=CLAIMED_RETENTION_DAYS)
-        remaining = expires_at - datetime.datetime.now(datetime.timezone.utc)
-        return max(remaining.days, 0)
-    except (TypeError, ValueError):
-        return None
+class Html:
+    @staticmethod
+    def esc(value):
+        return html.escape(str(value or ""))
 
 
-def esc(value):
-    return html.escape(str(value or ""))
+class EmptyState:
+    @staticmethod
+    def show(message):
+        st.markdown(f'<div class="fi-empty">{Html.esc(message)}</div>', unsafe_allow_html=True)
 
 
-# --- PHOTO CROP HELPERS (4:3) ---
-class ProcessedImage:
-    """Quacks like an uploaded file so save_to_supabase works unchanged."""
+# ---------------------------------------------------------------- session + cookies
 
-    def __init__(self, data, name="photo.jpg", type="image/jpeg"):
-        self._data = data
-        self.name = name
-        self.type = type
+class SessionField:
+    """Descriptor: an attribute stored in st.session_state."""
 
-    def getvalue(self):
-        return self._data
+    def __init__(self, default=None):
+        self._default = default
 
+    def __set_name__(self, owner, name):
+        self._key = name
 
-def crop_box(size, fx, fy):
-    w, h = size
-    if w * 3 > h * 4:
-        cw, ch = h * 4 // 3, h
-    else:
-        cw, ch = w, w * 3 // 4
-    return int((w - cw) * fx), int((h - ch) * fy), cw, ch
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return st.session_state.setdefault(self._key, self._default)
+
+    def __set__(self, obj, value):
+        st.session_state[self._key] = value
 
 
-def guide_preview(img, fx, fy):
-    work = img.copy()
-    work.thumbnail((1000, 1000))
-    left, top, cw, ch = crop_box(work.size, fx, fy)
-    dim = Image.blend(work, Image.new("RGB", work.size, (0, 0, 0)), 0.65)
-    dim.paste(work.crop((left, top, left + cw, top + ch)), (left, top))
-    draw = ImageDraw.Draw(dim)
-    accent = (168, 199, 250)
-    lw = max(2, work.width // 250)
-    draw.rectangle((left, top, left + cw - 1, top + ch - 1), outline=accent, width=lw)
-    cx, cy = left + cw // 2, top + ch // 2
-    arm = max(12, cw // 14)
-    draw.line((cx - arm, cy, cx + arm, cy), fill=accent, width=lw)
-    draw.line((cx, cy - arm, cx, cy + arm), fill=accent, width=lw)
-    draw.ellipse((cx - arm, cy - arm, cx + arm, cy + arm), outline=accent, width=lw)
-    return dim
+class AppState:
+    current_user = SessionField()
+    logged_out = SessionField(False)
+    pending_token = SessionField()
+    pending_delete = SessionField(False)
+    status_msg = SessionField()
+    report_n = SessionField(0)
+    report_msg = SessionField()
+    service = SessionField()
+
+    def reset_navigation(self):
+        st.session_state.pop("nav", None)
 
 
-def prepare_photo(img, fx, fy):
-    left, top, cw, ch = crop_box(img.size, fx, fy)
-    out = img.crop((left, top, left + cw, top + ch))
-    out.thumbnail((1200, 900))
-    buf = io.BytesIO()
-    out.save(buf, format="JPEG", quality=90)
-    return ProcessedImage(buf.getvalue())
+class CookieSession:
+    NAME = "foundit_refresh_token"
+    DAYS = 7
 
+    def __init__(self, state, auth):
+        self._state = state
+        self._auth = auth
+        self._cookies = stx.CookieManager()
 
-# --- CARD HELPERS ---
-def media_html(item):
-    if item.image_url:
-        style = f"background-image:url('{quote(item.image_url, safe=':/?=&%#')}')"
-        return f'<div class="fi-img" style="{style}"></div>'
-    return '<div class="fi-img fi-noimg">No photo</div>'
+    def restore(self):  # auto-login, survives page refresh
+        state = self._state
+        if state.current_user or state.logged_out:
+            return
+        token = self._cookies.get(self.NAME)
+        if token:
+            result = self._auth.restore(token)
+            if result.success:
+                state.current_user = result.user
+                state.pending_token = result.refresh_token
+                st.rerun()
 
-
-def chips_html(post, claimed=False):
-    item = post.item
-    status = item.tracking.current_status
-    chips = "" if claimed else f'<span class="fi-chip {STATUS_CLASS.get(status, "")}">{esc(status)}</span>'
-    chips += f'<span class="fi-chip">{esc(item.campus_location)}</span><span class="fi-chip">{esc(item.category.category_name)}</span>'
-    return chips
-
-
-def foot_text(post, claimed=False):
-    if claimed:
-        remaining = days_left(post.item.tracking.date_claimed)
-        return f"Removed in {remaining} day(s)" if remaining is not None else ""
-    return f"Posted by {esc(post.user.username)} on {esc(post.date_posted)}"
-
-
-def card_html(post, claimed=False):
-    item = post.item
-    desc = "" if claimed else f'<p class="fi-desc">{esc(item.description).replace(chr(10), "<br>")}</p>'
-    return (
-        f'{media_html(item)}<div class="fi-body"><div class="fi-title">{esc(item.item_name)}</div>'
-        f'<div class="fi-chips">{chips_html(post, claimed)}</div>{desc}'
-        f'<div class="fi-meta">{foot_text(post, claimed)}</div></div>'
-    )
-
-
-def render_card(post, claimed=False):
-    with st.container(key=f"card_{post.post_id}"):
-        st.markdown(card_html(post, claimed), unsafe_allow_html=True)
-
-
-def render_grid(posts, claimed=False):
-    cols = st.columns(2, gap="small")
-    for idx, col in enumerate(cols):
-        with col:
-            with st.container(key=f"grid_col_{idx}"):
-                for post in posts[idx::2]:
-                    render_card(post, claimed)
-
-
-def empty_state(message):
-    st.markdown(f'<div class="fi-empty">{esc(message)}</div>', unsafe_allow_html=True)
-
-
-if "categories" not in st.session_state:
-    st.session_state.categories = [
-        Category("Electronics", "CAT-01"),
-        Category("Tumblers/Bottles", "CAT-02"),
-        Category("IDs/Cards", "CAT-03"),
-        Category("Others", "CAT-04")
-    ]
-
-if "posts" not in st.session_state:
-    st.session_state.posts = load_database(st.session_state.categories)
-
-if "current_user" not in st.session_state:
-    st.session_state.current_user = None
-
-if "logged_out" not in st.session_state:
-    st.session_state.logged_out = False
-
-if "pending_token" not in st.session_state:
-    st.session_state.pending_token = None
-
-if "pending_delete" not in st.session_state:
-    st.session_state.pending_delete = False
-
-if "status_msg" not in st.session_state:
-    st.session_state.status_msg = None
-
-if "report_n" not in st.session_state:
-    st.session_state.report_n = 0
-
-if "report_msg" not in st.session_state:
-    st.session_state.report_msg = None
-
-# --- AUTO-LOGIN FROM COOKIE (survives page refresh) ---
-if not st.session_state.current_user and not st.session_state.logged_out:
-    saved_token = cookie_manager.get(COOKIE_NAME)
-    if saved_token:
-        restored = restore_session(saved_token)
-        if restored and "error" not in restored:
-            st.session_state.current_user = User(
-                username=restored["email"].split("@")[0],
-                institutional_id=restored["email"],
-                is_admin=restored["is_admin"],
+    def sync(self):  # write / clear the cookie safely
+        state = self._state
+        if state.pending_token and state.current_user:
+            self._cookies.set(
+                self.NAME,
+                state.pending_token,
+                expires_at=datetime.datetime.now() + datetime.timedelta(days=self.DAYS),
             )
-            st.session_state.pending_token = restored["refresh_token"]
-            st.rerun()
+            state.pending_token = None
+        if state.pending_delete and not state.current_user:
+            self._cookies.delete(self.NAME)
+            state.pending_delete = False
 
-# --- WRITE / CLEAR THE COOKIE SAFELY ---
-if st.session_state.pending_token and st.session_state.current_user:
-    cookie_manager.set(
-        COOKIE_NAME,
-        st.session_state.pending_token,
-        expires_at=datetime.datetime.now() + datetime.timedelta(days=COOKIE_DAYS),
-    )
-    st.session_state.pending_token = None
 
-if st.session_state.pending_delete and not st.session_state.current_user:
-    cookie_manager.delete(COOKIE_NAME)
-    st.session_state.pending_delete = False
+# ---------------------------------------------------------------- views
 
-# --- AUTHENTICATION ---
-if not st.session_state.current_user:
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        st.markdown(
-            f'<div class="fi-welcome"><div class="fi-logo">F</div><h2>Welcome to FoundIt</h2>'
-            f'<p>{esc(school.get_details())}</p></div>',
-            unsafe_allow_html=True,
+class PostCardView:
+    STATUS_CLASS = {Status.LOST: "fi-lost", Status.PENDING: "fi-pending", Status.CLAIMED: "fi-claimed"}
+
+    def __init__(self, post, claimed=False, retention_days=7):
+        self._post = post
+        self._claimed = claimed
+        self._retention_days = retention_days
+
+    def _media(self):
+        item = self._post.item
+        if item.image_url:
+            style = f"background-image:url('{quote(item.image_url, safe=':/?=&%#')}')"
+            return f'<div class="fi-img" style="{style}"></div>'
+        return '<div class="fi-img fi-noimg">No photo</div>'
+
+    def _chips(self):
+        item = self._post.item
+        status = item.tracking.status
+        chips = "" if self._claimed else f'<span class="fi-chip {self.STATUS_CLASS[status]}">{Html.esc(status.value)}</span>'
+        chips += f'<span class="fi-chip">{Html.esc(item.campus_location)}</span><span class="fi-chip">{Html.esc(item.category.name)}</span>'
+        return chips
+
+    def _footer(self):
+        if self._claimed:
+            remaining = self._post.item.tracking.days_left(self._retention_days)
+            return f"Removed in {remaining} day(s)" if remaining is not None else ""
+        return f"Posted by {Html.esc(self._post.user.username)} on {Html.esc(self._post.date_posted)}"
+
+    def html(self):
+        item = self._post.item
+        desc = "" if self._claimed else f'<p class="fi-desc">{Html.esc(item.description).replace(chr(10), "<br>")}</p>'
+        return (
+            f'{self._media()}<div class="fi-body"><div class="fi-title">{Html.esc(item.name)}</div>'
+            f'<div class="fi-chips">{self._chips()}</div>{desc}<div class="fi-meta">{self._footer()}</div></div>'
         )
-        with st.form("login_form"):
-            email = st.text_input("Institutional Email")
-            password = st.text_input("Password", type="password")
-            submit_login = st.form_submit_button("Login")
 
-            if submit_login:
-                auth_result = authenticate_user(email, password)
-                if auth_result["success"]:
-                    logged_user = User(username=email.split("@")[0], institutional_id=email, is_admin=auth_result["is_admin"])
-                    st.session_state.current_user = logged_user
-                    st.session_state.logged_out = False
-                    st.session_state.pending_token = auth_result["refresh_token"]
-                    st.rerun()
-                else:
-                    st.error(f"Authentication failed: {auth_result['error']}")
-else:
-    user = st.session_state.current_user
-    role = "Administrator" if user.is_admin else "Student/Faculty"
+    def render(self, key=None):
+        with st.container(key=key or f"card_{self._post.post_id}"):
+            st.markdown(self.html(), unsafe_allow_html=True)
 
-    # --- APP BAR ---
-    c_brand, c_user, c_out = st.columns([5, 3, 1.5], vertical_alignment="center")
-    with c_brand:
-        st.markdown(
-            f'<div class="fi-brand"><div class="fi-logo">F</div><div><div class="fi-name">FoundIt</div>'
-            f'<div class="fi-sub">{esc(school.get_details())}</div></div></div>',
-            unsafe_allow_html=True,
-        )
-    with c_user:
-        st.markdown(
-            f'<div class="fi-user"><div class="fi-avatar">{esc(user.username[:1].upper())}</div>'
-            f'<div><div class="fi-uname">{esc(user.username)}</div><div class="fi-role">{role}</div></div></div>',
-            unsafe_allow_html=True,
-        )
-    with c_out:
-        if st.button("Logout", key="logout"):
-            st.session_state.current_user = None
-            st.session_state.logged_out = True
-            st.session_state.pending_delete = True
-            st.session_state.pop("nav", None)
-            st.rerun()
 
-    if not user.is_admin:
-        st.caption("Standard account: only administrators can report or update items.")
+class PostGrid:
+    def __init__(self, posts, claimed=False, retention_days=7):
+        self._posts = posts
+        self._claimed = claimed
+        self._retention_days = retention_days
 
-    # --- NAVIGATION ---
-    sections = ["Feed", "Claimed"] + (["Report", "Update status"] if user.is_admin else [])
-    navigation = st.pills("Section", sections, default="Feed", key="nav", label_visibility="collapsed") or "Feed"
+    def render(self):
+        cols = st.columns(2, gap="small")
+        for idx, col in enumerate(cols):
+            with col:
+                with st.container(key=f"grid_col_{idx}"):
+                    for post in self._posts[idx::2]:
+                        PostCardView(post, self._claimed, self._retention_days).render()
 
-    # --- 1. FEED (active items only) ---
-    if navigation == "Feed":
+
+class LoginView:
+    def __init__(self, auth, state, institution):
+        self._auth = auth
+        self._state = state
+        self._institution = institution
+
+    def render(self):
+        _, mid, _ = st.columns([1, 2, 1])
+        with mid:
+            st.markdown(
+                f'<div class="fi-welcome"><div class="fi-logo">F</div><h2>Welcome to FoundIt</h2>'
+                f'<p>{Html.esc(self._institution.get_details())}</p></div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("login_form"):
+                email = st.text_input("Institutional Email")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Login")
+
+                if submitted:
+                    result = self._auth.login(email, password)
+                    if result.success:
+                        self._state.current_user = result.user
+                        self._state.logged_out = False
+                        self._state.pending_token = result.refresh_token
+                        st.rerun()
+                    else:
+                        st.error(f"Authentication failed: {result.error}")
+
+
+class AppBar:
+    def __init__(self, institution, user):
+        self._institution = institution
+        self._user = user
+
+    def render(self):  # returns True when Logout was clicked
+        c_brand, c_user, c_out = st.columns([5, 3, 1.5], vertical_alignment="center")
+        with c_brand:
+            st.markdown(
+                f'<div class="fi-brand"><div class="fi-logo">F</div><div><div class="fi-name">FoundIt</div>'
+                f'<div class="fi-sub">{Html.esc(self._institution.get_details())}</div></div></div>',
+                unsafe_allow_html=True,
+            )
+        with c_user:
+            st.markdown(
+                f'<div class="fi-user"><div class="fi-avatar">{Html.esc(self._user.avatar_initial)}</div>'
+                f'<div><div class="fi-uname">{Html.esc(self._user.username)}</div>'
+                f'<div class="fi-role">{Html.esc(self._user.role_label)}</div></div></div>',
+                unsafe_allow_html=True,
+            )
+        with c_out:
+            return st.button("Logout", key="logout")
+
+
+# ---------------------------------------------------------------- pages
+
+class Page(ABC):
+    title = ""
+    ALL_CAMPUSES = "All Campuses"
+
+    def __init__(self, service, state):
+        self._service = service
+        self._state = state
+
+    def _campus_filter(self, key):
+        options = [self.ALL_CAMPUSES] + self._service.institution.campuses
+        choice = st.selectbox("Campus", options, key=key, label_visibility="collapsed")
+        return None if choice == self.ALL_CAMPUSES else choice
+
+    @abstractmethod
+    def render(self, user):
+        ...
+
+
+class AdminPage(Page):
+    def render(self, user):
+        if not user.can_manage_items():
+            st.error("Only administrators can open this page.")
+            return
+        self._render(user)
+
+    @abstractmethod
+    def _render(self, user):
+        ...
+
+
+class FeedPage(Page):
+    title = "Feed"
+
+    def render(self, user):
         col_search, col_campus = st.columns([3, 1])
         with col_search:
-            search_query = st.text_input(
+            query = st.text_input(
                 "Search", "", key="feed_search", placeholder="Search by name, category or description",
                 label_visibility="collapsed",
-            ).strip().lower()
-        with col_campus:
-            campus_filter = st.selectbox(
-                "Campus", ["All Campuses"] + CAMPUS_LOCATIONS, key="feed_campus", label_visibility="collapsed"
             )
+        with col_campus:
+            campus = self._campus_filter("feed_campus")
 
-        posts_to_display = [
-            p for p in st.session_state.posts[::-1]
-            if p.item.tracking.current_status != "Claimed"
-        ]
-
-        if campus_filter != "All Campuses":
-            posts_to_display = [
-                p for p in posts_to_display
-                if p.item.campus_location == campus_filter
-            ]
-
-        if search_query:
-            posts_to_display = [
-                p for p in posts_to_display
-                if search_query in p.item.item_name.lower() or
-                   search_query in p.item.category.category_name.lower() or
-                   search_query in (p.item.description or "").lower()
-            ]
-
-        if not posts_to_display:
-            empty_state("No items match your search or filter.")
+        posts = self._service.active(campus, query)
+        if not posts:
+            EmptyState.show("No items match your search or filter.")
         else:
-            render_grid(posts_to_display)
+            PostGrid(posts, retention_days=self._service.RETENTION_DAYS).render()
 
-    # --- 2. CLAIMED ITEMS (kept for 7 days, then auto-purged) ---
-    elif navigation == "Claimed":
-        st.caption(f"Claimed items stay here for {CLAIMED_RETENTION_DAYS} days, then are removed automatically.")
-        claimed_campus = st.selectbox(
-            "Campus", ["All Campuses"] + CAMPUS_LOCATIONS, key="claimed_campus", label_visibility="collapsed"
-        )
 
-        claimed_posts = [
-            p for p in st.session_state.posts[::-1]
-            if p.item.tracking.current_status == "Claimed"
-        ]
-        if claimed_campus != "All Campuses":
-            claimed_posts = [p for p in claimed_posts if p.item.campus_location == claimed_campus]
+class ClaimedPage(Page):
+    title = "Claimed"
 
-        if not claimed_posts:
-            empty_state("No claimed items.")
+    def render(self, user):
+        st.caption(f"Claimed items stay here for {self._service.RETENTION_DAYS} days, then are removed automatically.")
+        campus = self._campus_filter("claimed_campus")
+
+        posts = self._service.claimed(campus)
+        if not posts:
+            EmptyState.show("No claimed items.")
         else:
-            render_grid(claimed_posts, claimed=True)
+            PostGrid(posts, claimed=True, retention_days=self._service.RETENTION_DAYS).render()
 
-    # --- 3. REPORT ITEM (Admin Only) ---
-    elif navigation == "Report" and user.is_admin:
-        rk = st.session_state.report_n
 
-        if st.session_state.report_msg:
-            st.success(st.session_state.report_msg)
-            st.session_state.report_msg = None
+class ReportPage(AdminPage):
+    title = "Report"
+
+    def _photo_section(self, rk):
+        uploaded = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"], key=f"r_photo_{rk}")
+        if not uploaded:
+            return None
+        try:
+            cropper = PhotoCropper(uploaded.getvalue())
+        except ValidationError as e:
+            st.error(str(e))
+            return None
+
+        fx = fy = 0.5
+        skey = f"{rk}_{uploaded.name}_{uploaded.size}"
+        if cropper.orientation == PhotoCropper.WIDE:
+            fx = st.slider("Move the frame left / right", 0, 100, 50, key=f"r_x_{skey}") / 100
+        elif cropper.orientation == PhotoCropper.TALL:
+            fy = st.slider("Move the frame up / down", 0, 100, 50, key=f"r_y_{skey}") / 100
+        st.image(cropper.guide(fx, fy))
+        st.caption("Only the bright area is posted. Keep the item inside the frame and on the center mark.")
+        return cropper.crop(fx, fy)
+
+    def _details_section(self, user, rk, photo):
+        name = st.text_input("Item Name", key=f"r_name_{rk}")
+        description = st.text_area("Description / Distinguishing Features", key=f"r_desc_{rk}")
+        campus = st.selectbox("Campus Holding Office", self._service.institution.campuses, key=f"r_campus_{rk}")
+        category = st.selectbox("Category", self._service.catalog.names(), key=f"r_cat_{rk}")
+
+        if st.button("Post Item", key="post_item"):
+            try:
+                self._service.report(user, name, description, category, campus, photo)
+            except ValidationError as e:
+                st.warning(str(e))
+            else:
+                self._state.report_n += 1
+                self._state.report_msg = "Item posted successfully and saved to Supabase!"
+                st.rerun()
+
+    def _render(self, user):
+        rk = self._state.report_n
+        if self._state.report_msg:
+            st.success(self._state.report_msg)
+            self._state.report_msg = None
 
         left, right = st.columns(2, gap="large")
-        photo = None
-
         with left:
-            uploaded_image = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"], key=f"r_photo_{rk}")
-            if uploaded_image:
-                try:
-                    src = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded_image.getvalue()))).convert("RGB")
-                except Exception:
-                    src = None
-                    st.error("Could not read this image. Try another photo.")
-                if src:
-                    w, h = src.size
-                    fx = fy = 0.5
-                    skey = f"{rk}_{uploaded_image.name}_{uploaded_image.size}"
-                    if w * 3 > h * 4:
-                        fx = st.slider("Move the frame left / right", 0, 100, 50, key=f"r_x_{skey}") / 100
-                    elif w * 3 < h * 4:
-                        fy = st.slider("Move the frame up / down", 0, 100, 50, key=f"r_y_{skey}") / 100
-                    st.image(guide_preview(src, fx, fy))
-                    st.caption("Only the bright area is posted. Keep the item inside the frame and on the center mark.")
-                    photo = prepare_photo(src, fx, fy)
-
+            photo = self._photo_section(rk)
         with right:
-            item_name = st.text_input("Item Name", key=f"r_name_{rk}")
-            description = st.text_area("Description / Distinguishing Features", key=f"r_desc_{rk}")
-            campus_location = st.selectbox("Campus Holding Office", CAMPUS_LOCATIONS, key=f"r_campus_{rk}")
+            self._details_section(user, rk, photo)
 
-            cat_names = [cat.category_name for cat in st.session_state.categories]
-            selected_cat_name = st.selectbox("Category", cat_names, key=f"r_cat_{rk}")
 
-            if st.button("Post Item", key="post_item"):
-                if item_name.strip():
-                    selected_cat = next(cat for cat in st.session_state.categories if cat.category_name == selected_cat_name)
-                    new_item = Item(item_name, description, selected_cat, campus_location=campus_location)
-                    today_date = datetime.date.today().strftime("%Y-%m-%d")
-                    new_post = Post(f"POST-{int(datetime.datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}", today_date, st.session_state.current_user, new_item)
+class UpdateStatusPage(AdminPage):
+    title = "Update status"
 
-                    save_to_supabase(new_post, image_file=photo)
-                    st.session_state.posts = load_database(st.session_state.categories)
-                    st.session_state.report_n += 1
-                    st.session_state.report_msg = "Item posted successfully and saved to Supabase!"
-                    st.rerun()
-                else:
-                    st.warning("Please provide an item name.")
+    @staticmethod
+    def _label(post):
+        return f"{post.item.name} ({post.item.tracking.status.value}) - {post.user.username}"
 
-    # --- 4. UPDATE TRACKING STATUS (Admin Only) ---
-    elif navigation == "Update status" and user.is_admin:
-        # Show the message saved before the rerun, then clear it
-        if st.session_state.status_msg:
-            st.success(st.session_state.status_msg)
-            st.session_state.status_msg = None
+    def _render(self, user):
+        if self._state.status_msg:  # message saved before the rerun
+            st.success(self._state.status_msg)
+            self._state.status_msg = None
 
-        if not st.session_state.posts:
-            empty_state("No items available to update.")
+        posts = list(reversed(self._service.posts))
+        if not posts:
+            EmptyState.show("No items available to update.")
+            return
+
+        by_id = {p.post_id: p for p in posts}
+        left, right = st.columns(2, gap="large")
+        with left:
+            selected_id = st.selectbox(
+                "Select Item to Update", list(by_id.keys()), format_func=lambda pid: self._label(by_id[pid])
+            )
+            new_status = st.radio("Select New Status", [s.value for s in Status], horizontal=True)
+            apply_update = st.button("Apply Status Update")
+        with right:
+            PostCardView(by_id[selected_id], retention_days=self._service.RETENTION_DAYS).render(key="card_preview")
+
+        if apply_update:
+            self._service.set_status(user, selected_id, new_status)
+            self._state.status_msg = f"Status updated to **{new_status}** in Supabase!"
+            st.rerun()
+
+
+# ---------------------------------------------------------------- application
+
+class FoundItApp:
+    PAGES = (FeedPage, ClaimedPage, ReportPage, UpdateStatusPage)
+
+    def __init__(self):
+        self._gateway = get_gateway()
+        self._state = AppState()
+        self._auth = AuthService(self._gateway)
+        self._cookies = CookieSession(self._state, self._auth)
+        self._institution = Institution("Mapúa Malayan Colleges Mindanao", "Davao City", ["RSY Building", "RG Birrey"])
+
+    def _service(self):
+        if self._state.service is None:
+            catalog = CategoryCatalog.default()
+            repository = SupabasePostRepository(
+                self._gateway, catalog, SupabaseImageStorage(self._gateway), self._institution.default_campus
+            )
+            self._state.service = LostAndFoundService(repository, catalog, self._institution)
+        return self._state.service
+
+    def _logout(self):
+        self._state.current_user = None
+        self._state.logged_out = True
+        self._state.pending_delete = True
+        self._state.service = None
+        self._state.reset_navigation()
+        st.rerun()
+
+    def _render_main(self, user):
+        service = self._service()
+        service.refresh_if_stale()
+        if AppBar(self._institution, user).render():
+            self._logout()
+
+        if not user.can_manage_items():
+            st.caption("Standard account: only administrators can report or update items.")
+
+        navigation = st.pills(
+            "Section", user.sections(), default="Feed", key="nav", label_visibility="collapsed"
+        ) or "Feed"
+        pages = {cls.title: cls(service, self._state) for cls in self.PAGES}
+        pages.get(navigation, pages["Feed"]).render(user)
+
+    def run(self):
+        Theme.apply()
+        self._cookies.restore()
+        self._cookies.sync()
+        user = self._state.current_user
+        if user is None:
+            LoginView(self._auth, self._state, self._institution).render()
         else:
-            post_options = {p.post_id: p for p in st.session_state.posts}
-            left, right = st.columns(2, gap="large")
-            with left:
-                selected_id = st.selectbox(
-                    "Select Item to Update",
-                    list(post_options.keys()),
-                    format_func=lambda pid: f"{post_options[pid].item.item_name} ({post_options[pid].item.tracking.current_status}) - {post_options[pid].user.username}",
-                )
-                target_post = post_options[selected_id]
-                new_status = st.radio("Select New Status", ["Lost", "Pending Claim", "Claimed"], horizontal=True)
-                apply_update = st.button("Apply Status Update")
-            with right:
-                with st.container(key="card_preview"):
-                    st.markdown(card_html(target_post), unsafe_allow_html=True)
+            self._render_main(user)
 
-            if apply_update:
-                target_post.item.tracking.update_tracking_status(new_status)
-                update_status_in_supabase(target_post.post_id, new_status)
-                st.session_state.posts = load_database(st.session_state.categories)
-                st.session_state.status_msg = f"Status updated to **{new_status}** in Supabase!"
-                st.rerun()
+
+def main():
+    st.set_page_config(page_title="FoundIt - Campus Lost & Found", page_icon="", layout="centered")
+    FoundItApp().run()
+
+
+main()
