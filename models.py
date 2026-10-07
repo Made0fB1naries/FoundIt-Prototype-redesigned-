@@ -1,5 +1,4 @@
 # models.py
-import io
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -7,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 import streamlit as st
-from PIL import Image, ImageDraw, ImageOps
 from supabase import create_client, Client
 
 
@@ -367,70 +365,6 @@ class AuthService:
             return AuthResult(UserFactory.create(response.user.email), response.session.refresh_token)
         except Exception as e:
             return AuthResult(error=str(e))
-
-
-# ---------------------------------------------------------------- photos
-
-class ProcessedImage:  # quacks like an uploaded file
-    def __init__(self, data, name="photo.jpg", type="image/jpeg"):
-        self._data = data
-        self.name = name
-        self.type = type
-
-    def getvalue(self):
-        return self._data
-
-
-class PhotoCropper:
-    WIDE, TALL, EXACT = "wide", "tall", "exact"
-    MAX_SAVED = (1200, 900)
-    MAX_PREVIEW = (1000, 1000)
-    ACCENT = (168, 199, 250)
-
-    def __init__(self, data):
-        try:
-            self._img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-        except Exception:
-            raise ValidationError("Could not read this image. Try another photo.")
-
-    @property
-    def orientation(self):
-        w, h = self._img.size
-        if w * 3 > h * 4:
-            return self.WIDE
-        if w * 3 < h * 4:
-            return self.TALL
-        return self.EXACT
-
-    @staticmethod
-    def _box(size, fx, fy):
-        w, h = size
-        cw, ch = (h * 4 // 3, h) if w * 3 > h * 4 else (w, w * 3 // 4)
-        return int((w - cw) * fx), int((h - ch) * fy), cw, ch
-
-    def guide(self, fx=0.5, fy=0.5):
-        work = self._img.copy()
-        work.thumbnail(self.MAX_PREVIEW)
-        left, top, cw, ch = self._box(work.size, fx, fy)
-        dim = Image.blend(work, Image.new("RGB", work.size, (0, 0, 0)), 0.65)
-        dim.paste(work.crop((left, top, left + cw, top + ch)), (left, top))
-        draw = ImageDraw.Draw(dim)
-        lw = max(2, work.width // 250)
-        draw.rectangle((left, top, left + cw - 1, top + ch - 1), outline=self.ACCENT, width=lw)
-        cx, cy = left + cw // 2, top + ch // 2
-        arm = max(12, cw // 14)
-        draw.line((cx - arm, cy, cx + arm, cy), fill=self.ACCENT, width=lw)
-        draw.line((cx, cy - arm, cx, cy + arm), fill=self.ACCENT, width=lw)
-        draw.ellipse((cx - arm, cy - arm, cx + arm, cy + arm), outline=self.ACCENT, width=lw)
-        return dim
-
-    def crop(self, fx=0.5, fy=0.5):
-        left, top, cw, ch = self._box(self._img.size, fx, fy)
-        out = self._img.crop((left, top, left + cw, top + ch))
-        out.thumbnail(self.MAX_SAVED)
-        buf = io.BytesIO()
-        out.save(buf, format="JPEG", quality=90)
-        return ProcessedImage(buf.getvalue())
 
 
 # ---------------------------------------------------------------- persistence
