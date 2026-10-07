@@ -7,7 +7,7 @@ from urllib.parse import quote
 import streamlit as st
 import extra_streamlit_components as stx
 
-from models import (AuthService, CategoryCatalog, Institution, LostAndFoundService, PhotoCropper,
+from models import (AuthService, CategoryCatalog, Institution, LostAndFoundService,
                     Status, SupabaseImageStorage, SupabasePostRepository, ValidationError, get_gateway)
 
 
@@ -331,24 +331,7 @@ class ReportPage(AdminPage):
     title = "Report"
 
     def _photo_section(self, rk):
-        uploaded = st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"], key=f"r_photo_{rk}")
-        if not uploaded:
-            return None
-        try:
-            cropper = PhotoCropper(uploaded.getvalue())
-        except ValidationError as e:
-            st.error(str(e))
-            return None
-
-        fx = fy = 0.5
-        skey = f"{rk}_{uploaded.name}_{uploaded.size}"
-        if cropper.orientation == PhotoCropper.WIDE:
-            fx = st.slider("Move the frame left / right", 0, 100, 50, key=f"r_x_{skey}") / 100
-        elif cropper.orientation == PhotoCropper.TALL:
-            fy = st.slider("Move the frame up / down", 0, 100, 50, key=f"r_y_{skey}") / 100
-        st.image(cropper.guide(fx, fy))
-        st.caption("Only the bright area is posted. Keep the item inside the frame and on the center mark.")
-        return cropper.crop(fx, fy)
+        return st.file_uploader("Item Photo", type=["jpg", "jpeg", "png"], key=f"r_photo_{rk}")
 
     def _details_section(self, user, rk, photo):
         name = st.text_input("Item Name", key=f"r_name_{rk}")
